@@ -114,7 +114,9 @@ struct VramBudget {
 /* Writes cfg.vram_weights_mib / cfg.vram_kv_mib, the one number every downstream consumer reads
  * (an uneven world's cheaper rank re-splits it with vram_budget_rank_split). Takes the smallest
  * capacity and free VRAM across ranks and the largest arena, so the split fits every card.
- * Refuses, by name and size, when the fixed terms alone exceed the card. */
+ * Refuses, by name and size, when the fixed terms alone exceed the card or the weights leave the
+ * KV cache empty: a zero KV budget never leaves the resolver, because the pools treat one as an
+ * unresolved split and would stop startup on that internal invariant instead of a fit verdict. */
 int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out);
 
 /* The same split on a copy of `cfg`, without writing or logging anything: for choosing between

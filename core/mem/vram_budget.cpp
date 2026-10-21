@@ -127,14 +127,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* ---- the static weights come off the top, as a floor ------------------------------------ */
     b.statics = std::min(b.statics, b.claimable);
-    if (b.statics >= b.claimable && b.claimable > 0) {
-        /* Not fatal: the planner demotes what does not fit and the model serves slowly. Warn so
-         * the slowdown is explained at startup. */
-        if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card can "
-                          "give, so every expert streams from host memory and the KV cache gets "
-                          "nothing; use more cards or a smaller --max-num-batched-tokens",
-                          humanb(b.statics).c_str(), humanb(b.claimable).c_str());
-    }
+    /* When the static weights alone take the whole card, the split below gives the KV cache zero
+     * bytes; that empty cache is refused by name at the end of the split, before the pools are
+     * configured. (There was never a slow-serve-with-an-empty-cache case to warn about: a zero KV
+     * budget stops startup either way, and until the refusal below it stopped it as Pools::configure's
+     * internal wiring invariant rather than a fit verdict.) */
     b.elastic = b.claimable - b.statics;
     if (b.elastic < 0) b.elastic = 0;
 
@@ -317,6 +314,36 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         humanb(cfg.vram_weights_mib * kMiB).c_str(), "static + experts",
         humanb(cfg.vram_kv_mib * kMiB).c_str(), "the cache's share",
         humanb(unclaimed).c_str());
+
+    /* A zero KV budget is never a resolved split. Pools::configure treats one as "the resolver
+     * did not run" and stops startup on that internal invariant, which reads to a user as an
+     * engine crash rather than a fit verdict. So the resolver never emits one: when the card has
+     * nothing left for the cache after the fixed terms and the static weights, the printed table
+     * above stands as the budget and the refusal below names the shortfall and the knobs. (The
+     * weights pool has a one-MiB floor because an empty one is legal; an empty cache serves
+     * nothing.) */
+    if (cfg.vram_kv_mib <= 0) {
+        b.report += kv_one > 0
+            ? fmt("  ==============================\n"
+                  "does not fit: the fixed terms and the static weights leave the KV cache\n"
+                  "  nothing, and one --max-model-len sequence needs %s of it:\n"
+                  "  short by           %10s\n"
+                  "  Fix by quantizing the weights (an mxfp4 or fp8 checkpoint), shrinking\n"
+                  "  --max-model-len or --max-num-seqs, lowering --max-num-batched-tokens (the\n"
+                  "  arena scales with it), keeping the token embedding or an encoder tower in\n"
+                  "  host RAM (--embedding-placement ram, --vision-tower-placement ram), or a\n"
+                  "  bigger card.\n",
+                  humanb(kv_one).c_str(), humanb(kv_one).c_str())
+            : fmt("  ==============================\n"
+                  "does not fit: the fixed terms and the static weights leave the KV cache\n"
+                  "  nothing, and a cache that addresses no token serves no request.\n"
+                  "  Fix by quantizing the weights (an mxfp4 or fp8 checkpoint), lowering\n"
+                  "  --max-num-batched-tokens (the arena scales with it), keeping the token\n"
+                  "  embedding or an encoder tower in host RAM, or a bigger card.\n");
+        if (log) RAD_ERR("%s", b.report.c_str());
+        if (out) *out = b;
+        return RAD_E_NOMEM;
+    }
 
     if (out) *out = b;
     return RAD_OK;

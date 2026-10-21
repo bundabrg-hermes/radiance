@@ -455,6 +455,9 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     f.statics    = 2LL << 30;
     f.experts    = 200LL << 30;
     f.kv_ceiling = 100LL << 30;
+    f.lends      = true;      /* with no lender the 200 GiB expert plane would starve the cache to
+                               * zero bytes, which the resolver now refuses; this test is about
+                               * the queue term, and a lending cache keeps the geometry viable */
     VramBudget b0;
     CHECK_OK(vram_budget_resolve(c, { f }, &b0));
 
@@ -508,6 +511,29 @@ TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
     VramBudget b2;
     CHECK(vram_budget_resolve(c2, { tiny }, &b2) < 0);
     CHECK(b2.report.find("short by") != std::string::npos);
+}
+
+TEST(an_over_vram_weight_set_refuses_with_the_budget_table) {
+    /* A bf16 container larger than the card: the static weights take everything the card can
+     * give, so the split would hand the KV cache zero bytes. That must be the resolver's own
+     * refusal, printed under the full budget table -- not a zero budget reaching the pools, which
+     * read one as "the resolver did not run" and stopped startup on an internal invariant. */
+    Config c = small_config();
+    c.vram_weights_mib = 0; c.vram_kv_mib = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 24LL << 30;                    /* a 24 GiB card */
+    f.free       = f.capacity;
+    f.arena      = 1LL << 30;
+    f.statics    = 23LL << 30;                    /* bf16 weights: more than the card can give */
+    f.kv_ceiling = 300LL << 20;
+    f.kv_one     = 300LL << 20;
+    VramBudget b;
+    CHECK(vram_budget_resolve(c, { f }, &b) < 0);
+    CHECK(b.report.find("VRAM budget") != std::string::npos);   /* the table ran and printed */
+    CHECK(b.report.find("does not fit") != std::string::npos);
+    CHECK(b.report.find("quantizing") != std::string::npos);    /* actionable knobs named */
+    CHECK(b.report.find("pool budgets are empty") == std::string::npos);
 }
 
 /* ================================================================== group sizing */
@@ -5541,11 +5567,15 @@ TEST(the_vram_budget_never_grants_more_than_the_card) {
             if (!untouched) bad("the trial wrote the configuration");
             if (rc != RAD_OK) {
                 ++refused;
-                if (rc != RAD_E_NOMEM || b.claimable >= 0 || !has(b.report, "short by"))
+                const bool fixed_over = b.claimable < 0 && has(b.report, "short by");
+                const bool empty_cache = b.claimable >= 0 && b.kv == 0 &&
+                                         has(b.report, "does not fit");
+                if (rc != RAD_E_NOMEM || !(fixed_over || empty_cache))
                     bad("a refusal without its shortfall");
                 continue;
             }
             ++granted;
+            if (cfg.vram_kv_mib <= 0) bad("resolved OK with an empty KV budget");
             staged += b.stage > 0;
             lent += b.lends;
             shared += b.headroom > cfg.gpu_headroom_mib * MiB;
